@@ -23,7 +23,6 @@ SPDX-License-Identifier: Apache-2.0
   - [How the proxy starts the command](#how-the-proxy-starts-the-command)
   - [Several destination containers](#several-destination-containers)
   - [If the agent restarts midway](#if-the-agent-restarts-midway)
-  - [Restart policy and later restarts](#restart-policy-and-later-restarts)
   - [Probes](#probes)
   - [API](#api)
   - [Security](#security)
@@ -31,9 +30,6 @@ SPDX-License-Identifier: Apache-2.0
   - [Dependencies](#dependencies)
   - [Test Plan](#test-plan)
   - [Graduation Criteria](#graduation-criteria)
-- [Open Questions](#open-questions)
-  - [Should a missing checkpoint fall back?](#should-a-missing-checkpoint-fall-back)
-  - [Facts to confirm on a node](#facts-to-confirm-on-a-node)
 - [Alternatives](#alternatives)
 - [Appendix](#appendix)
   - [Restore steps by color](#restore-steps-by-color)
@@ -62,14 +58,16 @@ can work when the restore cannot.
 
 This proposal is about what happens after a restore has failed. It is separate
 from restore retry (#247), which makes transient failures succeed on another
-attempt. When retry exists, fallback runs after the retries are used up.
+attempt. Fallback acts when the restore has failed, whatever the cause: for
+example a damaged checkpoint, or a node that refuses it.
 
 ### Goals
 
-1. A restore that failed, with retry exhausted, on a Pod that opted in and whose
-   container is not [tainted](#which-failures-can-cold-start-green-yellow-red),
-   ends with the Pod running exactly as its Pod spec describes (image, command,
-   arguments, environment, mounts, probes), with no action from the caller.
+1. A restore that has failed, on a Pod whose restore failure policy is
+   `cold-start` and whose container is not
+   [tainted](#which-failures-can-cold-start-green-yellow-red), ends with the Pod
+   running exactly as its Pod spec describes (image, command, arguments,
+   environment, mounts, probes), with no action from the caller.
 2. The cold start happens in place: the same container.
 3. The Pod behaves as if started without Snapshot, except for the record of the
    failed restore: the `Restored=False` condition and an event.
@@ -77,32 +75,38 @@ attempt. When retry exists, fallback runs after the retries are used up.
 5. Fallback never runs the command in a tainted container (see
    [green, yellow, red](#which-failures-can-cold-start-green-yellow-red)). Those
    failures end as they do today.
-6. Fallback is a per-Pod switch, off by default, with no new CRD field or
-   controller.
+6. The behavior is chosen per Pod by an annotation, and the default is not to
+   cold start. There is no new CRD field or controller.
 
 ### Non-Goals
 
-1. **Retrying a failed restore** (#247). Fallback acts after the retries.
+1. **Retrying a failed restore** (#247). Fallback acts once the restore has
+   failed.
 2. **Nodes without the restore proxy.** On those, a Pod cannot fall back.
-3. **Restarting the container.** The first cold start happens in place and needs
-   no restart. What a restarted container does, including restoring again into
-   it, is the work of #247 and PR #174. See
-   [Restart policy and later restarts](#restart-policy-and-later-restarts).
+3. **What a restarted container does.** The first cold start happens in place
+   and needs no restart. What a restarted container does, including restoring
+   again into it, is not part of this proposal (see #247 and PR #174).
+4. **A restore Pod whose `PodSnapshot` does not exist or is not `Ready` yet.**
+   It keeps waiting, as it does today. That wait is not a failed restore, so it
+   never reaches fallback.
 
 ## Proposal
 
-A Pod turns fallback on with the annotation
-`nvidia.com/restore-fallback-to-cold-start: enabled`. The restore proxy
+A Pod opts in with the annotation
+`nvidia.com/restore-failure-policy: cold-start`. The restore proxy
 (`snapshot-restore-proxy`) is already PID 1 of every destination container,
 waiting for the restore result. When the restore fails, the node agent decides
 whether a cold start is allowed. If it is, the agent tells the proxy, and the
 proxy replaces itself with the container's own command.
 
-The agent starts a cold start only if all three hold:
+The moment that matters is when the restore has failed: the point where the
+agent today writes `restore-failed` and publishes the `Restored=False`
+condition. Just before the agent writes `restore-failed`, it starts a cold start
+instead, if both hold:
 
-1. **The retries are used up.** There is nothing left to try for this restore.
-2. **Cold start is on.** The Pod has the annotation set to `enabled`.
-3. **The container can cold start.** The failed restore did not change the
+1. **The policy is cold-start.** The Pod's `nvidia.com/restore-failure-policy`
+   is `cold-start`.
+2. **The container can cold start.** The failed restore did not change the
    container, or the agent has undone the change. Otherwise the container
    stays as it is today.
 
@@ -112,8 +116,8 @@ sequenceDiagram
     participant F as Control directory
     participant P as Restore proxy (PID 1)
 
-    A->>A: the restore fails
-    A->>A: retries used up, cold start on, container can cold start
+    A->>A: the restore has failed
+    A->>A: policy is cold-start + the container can cold start
     A->>A: 1. publish Restored=False + fallback sentence
     A->>F: 2. write the cold-start trigger
     P->>F: 3. sees the trigger, removes it
@@ -146,8 +150,8 @@ correct on any node.
 
 A replica falls back, starts cold, and later crashes (an out-of-memory kill, for
 example). The kubelet restarts it by the Pod's `restartPolicy`, with the usual
-back-off. What the new container does is described in
-[Restart policy and later restarts](#restart-policy-and-later-restarts).
+back-off. What the new container does is outside this proposal (see
+[Non-Goals](#non-goals)).
 
 #### Story 4: a team wants a failed restore to stay failed
 
@@ -159,13 +163,12 @@ a Pod that serves anyway. It leaves the annotation unset.
 - **Not every failure can cold start.** After a restore has started changing the
   container, the container may not be clean. Those failures end as they do today
   (see [green, yellow, red](#which-failures-can-cold-start-green-yellow-red)).
-  Phase 1 covers the failures found before the container is touched.
-- **The restore flow and the cold-start state must change together.** The
-  agent cannot tell that a new write was added inside a step the table calls
-  clean or modified, or that an undo was forgotten. Anyone who changes the
-  restore flow updates the table, and the state calls, in the same change, and a
-  reviewer checks it. Tests cover the steps they inject failures into, so they
-  catch a wrong row, but not a change that nobody classified.
+  For now, only the failures found at green steps cold start.
+- **The restore flow and the table must change together.** The agent cannot tell
+  that a new write was added inside a step the table calls green. Anyone who
+  changes the restore flow updates the table in the same change, and a reviewer
+  checks it. Tests cover the steps they inject failures into, so they catch a
+  wrong row, but not a change that nobody classified.
 - **Probes must suit both starts.** See [Probes](#probes).
 - **A workload that crashes on every start loops**, bounded by the kubelet's
   restart back-off and the restart policy.
@@ -176,22 +179,24 @@ a Pod that serves anyway. It leaves the annotation unset.
 ### When the agent starts a cold start
 
 One function in the node agent, `requestColdStart`, is the only place that tells
-a proxy to cold start. The controller calls it from the point where a restore
-ends in failure, and only when all three conditions of the
-[Proposal](#proposal) hold:
+a proxy to cold start. The controller calls it at the point where a restore
+has failed, just before it would write `restore-failed`, and only when both
+conditions of the [Proposal](#proposal) hold:
 
 | Condition | Where it comes from |
 | --- | --- |
-| Retries used up | Restore retry (#247). Today only "not yet" waits retry (30 s, no limit); every other failure is final at once. |
-| Cold start on | `nvidia.com/restore-fallback-to-cold-start` is `enabled` on the Pod. |
-| Container can cold start | The container is not tainted: it is clean, or modified and cleaned by its undo list (see below). |
+| Policy is cold-start | `nvidia.com/restore-failure-policy` is `cold-start` on the Pod. |
+| Container can cold start | The container is not tainted: it is clean, or modified and undone (see below). Today a modified container counts as tainted. |
+
+That the restore has failed is the trigger, not a condition, whatever the
+cause: a damaged checkpoint, a node that refuses it, a CRIU or CUDA error, or
+retries used up (#247).
 
 ```text
-on restore failure for destination D:
-  if retriesLeft(D) > 0:              retry (#247)
-  elif !annotationOn(pod):            fail as today
-  elif tainted(D):                    fail as today
-  else:                               requestColdStart(D)
+when the restore of destination D has failed:
+  if policy(pod) != cold-start:     fail as today
+  elif tainted(D):                  fail as today
+  else:                             requestColdStart(D)
 ```
 
 `requestColdStart` does two steps, in this order:
@@ -199,15 +204,16 @@ on restore failure for destination D:
 1. **Publish the terminal condition.** It sets `nvidia.com/Restored` to `False`
    with the original reason (`RestoreFailed`, or `RestoreIncompatible` when the
    node refused the checkpoint), and ends the message with `Falling back to the
-   container command.` The Pod event carries the same message. This is a
-   server-side apply on the status subresource, so conditions owned by the
-   kubelet are untouched.
-2. **Write the trigger.** It writes `cold-start` into the destination
-   container's control directory. If it still cannot after a few attempts, the
-   agent replaces the condition's message with the failure text and `Fallback
-   could not be prepared: <cause>.` (same reason, still terminal) and ends the
-   restore as it does today (`restore-failed`, then the kill), so the condition
-   never promises a cold start that does not happen.
+   container command.` This is a server-side apply on the status subresource, so
+   conditions owned by the kubelet are untouched.
+2. **Write the trigger, then record it.** It writes `cold-start` into the
+   destination container's control directory and emits the "cold start
+   requested" event. If it still cannot write the trigger after a few attempts,
+   the agent replaces the condition's message with the failure text and `Fallback
+   could not be prepared: <cause>.` (same reason, still terminal), emits the
+   "cold start not possible" event, and ends the restore as it does today
+   (`restore-failed`, then the kill), so the condition never promises a cold
+   start that does not happen.
 
 The condition comes first because it is the record of what is owed: it is what
 the agent finds again after a restart (see
@@ -218,15 +224,15 @@ the agent finds again after a restart (see
 own when it sees `restore-failed`. For a cold start the agent does neither,
 because it must not end the container.
 
-**When a cold start is not possible**, because any of the three conditions does
-not hold, nothing changes: the agent writes `restore-failed` and kills PID 1.
-The container ends, and the kubelet restarts it or lets the Pod end, by the
+**When a cold start is not possible**, because a condition does not hold, the
+current failure behavior stays: the agent writes `restore-failed` and kills
+PID 1. The container ends, and the kubelet restarts it or lets the Pod end, by the
 Pod's `restartPolicy`, which also frees the Pod's resources.
 
 ### Which failures can cold start: green, yellow, red
 
-An in-place cold start is is possible if the container looks as it was before
-the restore. A restore changes the container in steps, so each step has a color,
+An in-place cold start is possible if the container looks as it was before the
+restore. A restore changes the container in steps, so each step has a color,
 and a container is clean, modified, or tainted:
 
 - **Green, clean:** nothing in the container was touched. The agent can cold
@@ -237,63 +243,34 @@ and a container is clean, modified, or tainted:
   container is clean. The restore ends as it does today. The agent never cold
   starts a tainted container.
 
-For example, a restore stages the rootfs diff (undo: delete the staged file) and
-writes the CUDA job file (undo: delete it). If it fails right there, the agent
-runs both undos, in reverse order, and cold starts. If it had gone on to apply
-the rootfs diff, which has no undo, the container would be tainted and the
-restore would end as it does today.
+**In the current implementation every yellow step counts as red.** There is no
+undo yet, so a container the restore has touched is tainted and its restore ends
+as it does today. Only a failure at a green step cold starts, which covers
+Stories 1 and 2. A step turns from red to yellow when its undo is added and
+tested on a node.
 
-These rules keep the tracking safe:
-
-- **Record first, then act.** A step adds its undo, or marks the container
-  tainted, *before* it changes anything. A step that dies half way has already
-  changed the container, so an undo must work even if its change never
-  happened. For example, "delete this file if it exists".
-- **Tainted is final.** Nothing makes a tainted container clean again, even if
-  later steps succeed.
-- **A crash is tainted.** The list lives in the memory of `nsrestore`. If
-  `nsrestore` is killed, the list is lost and nothing can be undone.
-- **An unclassified step is tainted.** The agent decides by the restore step a
-  failure came from (the `Step` names in `agent/internal/executor/step.go`). A
-  step with no row in the [table of steps](#restore-steps-by-color) counts as
-  tainted, so a new step fails safe, and a test checks that every restore step
-  has a row.
-- **The list is only for the fallback after a failure.** Cleanup that already runs
-  on every exit stays as it is, such as the `/proc/sys` remount. The list holds
-  what only a cold start needs undone. For example, a successful restore must
-  keep the CUDA job file, but a cold start must not.
-- **One list per side.** The host side and `nsrestore` each keep one.
-  `nsrestore` runs its own undos, then reports in its result whether the
-  container is clean or tainted, and why.
-
-The are two development phases:
-
-- **Phase 1: green or red.** Every step is one or the other, and there is no undo
-  list. A failure before `executeRestore` in `nsrestore` is green, and the agent
-  cold starts. A failure from `executeRestore` on is red, even for a step that is
-  yellow or green in the [table of steps](#restore-steps-by-color), because
-  nothing is undone. This covers Stories 1 and 2.
-- **Phase 2: add yellow.** The undo list and the modified state arrive. A step
-  moves from red to yellow one at a time, when its undo is added and tested on a
-  node.
-
-The [table of steps](#restore-steps-by-color), in the appendix, lists every
-restore step with its target color and undo, which phase 2 builds, and what
-phase 1 does with it.
+The agent decides by the restore step a failure came from (the `Step` names in
+`agent/internal/executor/step.go`). A step with no row in the
+[table of steps](#restore-steps-by-color) counts as tainted, so a new step fails
+safe, and a test checks that every restore step has a row. Inside `nsrestore`, a
+failure from `executeRestore` on is red whatever the step's color. The table, in
+the appendix, lists every restore step with its target color and what the
+current implementation does with it.
 
 ### How the proxy starts the command
 
-The command travels as the proxy's own arguments. When the kubelet creates a
-destination container, the NRI plugin sets its command to the proxy followed by
-the container's original command and arguments:
+The command travels as the proxy's own arguments, after a `--`. When the kubelet
+creates a destination container, the NRI plugin sets its command to the proxy,
+then `--`, then the container's original command and arguments:
 
 ```text
-/snapshot-control/snapshot-restore-proxy <original command> <original args...>
+/snapshot-control/snapshot-restore-proxy -- <original command> <original args...>
 ```
 
-The proxy ignores them unless it cold starts. They are set again at every
-container creation, and nothing in the Pod can change them. The agent's check
-that PID 1 is the proxy compares only the program, not the arguments.
+The proxy ignores them unless it cold starts. Everything after the first `--` is
+the command, passed on as it is, with no parsing or escaping. They are set again
+at every container creation, and nothing in the Pod can change them. The agent's
+check that PID 1 is the proxy compares only the program, not the arguments.
 
 The agent asks for a cold start with one file in the container's control
 directory (`/snapshot-control`, one subdirectory per destination, see
@@ -311,7 +288,7 @@ The proxy checks for the trigger in every check of the control directory, before
    the container's `PATH`. The command is PID 1, with the environment and user
    the Pod spec gives.
 
-If the proxy has no command in its arguments, it exits 113 (the existing
+If the proxy has no `--`, or nothing after it, it exits 113 (the existing
 proxy-error code). If the program is not found, it exits 127; if `exec` fails for
 another reason, 126, as a shell does.
 
@@ -352,15 +329,6 @@ order:
    before the cold start was requested.`, then ends the restore as it does today
    (`restore-failed`, then the kill).
 
-### Restart policy and later restarts
-
-After it, the container is ordinary. When it ends, `restartPolicy` decides, with
-the usual back-off. The new container repeats the same flow: it tries to restore,
-until the restore succeeds or retry is exhausted, and then it cold starts in
-place. Restoring into a restarted container is the work of #247 and PR #174. So
-the annotation is a plain enabled or disabled switch, with no counter of earlier
-cold starts.
-
 ### Probes
 
 Fallback changes no probe. The Pod's probes apply to a restore and to a cold
@@ -375,13 +343,13 @@ cold-started container never produces that file, so the kubelet would kill it.
 ### API
 
 No CRD, status field, or condition type is added. One annotation is new:
-**`nvidia.com/restore-fallback-to-cold-start`**, on the restore Pod:
+**`nvidia.com/restore-failure-policy`**, on the restore Pod:
 
-- `enabled`: a failed restore that can cold start does.
-- `disabled`, or absent (the default): a failed restore ends as today.
+- `fail`, or absent (the default): a failed restore ends as today.
+- `cold-start`: a failed restore that can cold start does.
 
-An unrecognized value is logged and treated as `disabled`, because the agent
-cannot reject the Pod. The `cold-start` file and the proxy's arguments are
+An unrecognized value is logged and treated as `fail`, because the agent cannot
+reject the Pod. The `cold-start` file and the proxy's arguments are
 internal to the agent, the NRI plugin and the proxy; the restore Pod contract
 documents the file next to `restore-complete`.
 
@@ -408,9 +376,6 @@ No security impact is expected.
 
 ### Dependencies
 
-- **Restore retry (#247, PR #836).** Supplies "retries used up". The proxy and
-  NRI plugin changes do not depend on it and can land first. The agent change
-  that calls `requestColdStart` lands after it.
 - The restore proxy, which needs containerd 2.2 or newer with NRI v0.10 or newer
   (see `docs/reference/restore-pod-contract.md`), and the NRI socket mounted in
   the agent DaemonSet (charts newer than 0.2.0 do).
@@ -421,22 +386,23 @@ Tracking: #322 (design), #689 (implementation), #244 (feature).
 
 **Unit.**
 
-- The annotation: `enabled`, `disabled`, absent, and an unrecognized value.
-- The NRI plugin sets the proxy's arguments to the original command and args at
-  every creation, and a container with no args still restores.
+- The annotation: `cold-start`, `fail`, absent, and an unrecognized value.
+- The NRI plugin sets the proxy's arguments to `--` followed by the original
+  command and args at every creation, and a container with no args still
+  restores.
 - The agent's PID 1 check accepts the proxy with arguments and refuses another
   program.
 - The proxy: with the trigger it removes the trigger and
   `exec`s the command from its arguments (a stub `exec` in the test); the trigger wins over
-  `restore-complete` and `restore-failed`; no command in the arguments
-  exits 113; program not found exits 127; `exec` failure exits 126; and without a
+  `restore-complete` and `restore-failed`; no `--`, or no command after it,
+  exits 113; a command whose own arguments start with `--` is passed on whole; program not found exits 127; `exec` failure exits 126; and without a
   trigger it behaves as today.
 - `requestColdStart`: the condition is published before the trigger; a trigger
   write failure ends the restore as today with the "could not be prepared"
   message; and after an agent restart a Pod with the fallback sentence is left
   alone when the trigger exists or PID 1 is not the proxy, and ends as today,
   with the message replaced, when neither holds.
-- The gate: each of the three conditions false on its own gives today's result.
+- The gate: each of the two conditions false on its own gives today's result.
 - Classification: each row of the color table, with a failure injected into that
   step; and every restore `Step` has a row, so a new step without one fails the
   test.
@@ -445,61 +411,18 @@ Tracking: #322 (design), #689 (implementation), #244 (feature).
 
 **End to end, on a GPU node.**
 
-- A missing or unreadable checkpoint, and an incompatible checkpoint, end with the
-  Pod serving the container command, with `Restored=False` and the fallback
-  sentence, also with `restartPolicy: Never`.
-- A truncated rootfs diff (red in phase 1) fails as today.
-- With the annotation `disabled`, a failed restore stays failed.
+- A `Ready` checkpoint whose artifact is missing or unreadable, and an
+  incompatible checkpoint, end with the Pod serving the container command, with
+  `Restored=False` and the fallback sentence, also with `restartPolicy: Never`.
+- A truncated rootfs diff (red) fails as today.
+- With the policy `fail`, or no annotation, a failed restore stays failed.
 - A healthy restore is unaffected.
 - The cold command is PID 1 and gets signals as in a Pod without Snapshot.
 - The container is not restarted by the cold start (restart count unchanged).
 
 ### Graduation Criteria
 
-* Phase 1: cold start for the green steps, with unit and end-to-end
-* Phase 2: the yellow steps with their undo tested on a node, the [facts to confirm](#facts-to-confirm-on-a-node)
-decided, the restart behavior agreed with #247 and PR #174, and metrics exist.
-
-## Open Questions
-
-### Should a missing checkpoint fall back?
-
-A restore Pod whose `PodSnapshot` does not exist, or is not `Ready`, today waits
-and the controller retries every 30 s with no limit. The wait is deliberate: a
-Pod may be created before its checkpoint is `Ready`. So today it never reaches
-fallback.
-
-- **A: fall back after the retry budget (proposed).** #247 gives the wait a
-  deadline.
-- **B: leave it waiting.** Race-free, but a checkpoint never taken leaves the Pod
-  waiting forever.
-- **C: fall back at once.** A Pod created moments before its checkpoint is
-  `Ready` would cold start when a restore would have worked seconds later.
-
-A `Ready` checkpoint whose artifact is gone is a failed restore, not part of this
-question.
-
-### Facts to confirm on a node
-
-The color table rests on facts read from the code. These are my reading of CRIU
-and the kernel, and a test on a node must confirm them before a row moves to
-yellow:
-
-1. CRIU kills the tasks it restored when `Restore` fails after `PreRestore`.
-2. The driver frees GPU memory when the restored processes die.
-3. A SIGKILL of `nsrestore` skips the `/proc/sys` remount, and what it leaves
-   mounted.
-4. Whether capture writes a non-empty rootfs diff for an empty upper directory,
-   so the "no archive" path is rare.
-5. Whether real overlayfs deletions appear as `.wh.<name>` files, which
-   decides if the deleted-files step ever runs.
-6. How the target workloads mount `/dev/shm` (a Pod volume or the runtime
-   default), which decides how much the remount matters.
-7. Which restore step real failures come from, from the `step` in the `nsrestore`
-   result, which decides where to start the yellow work.
-8. That the proxy's user can remove a file in its control directory (an
-   `emptyDir` is created with mode `0777`, and each destination has a
-   `subPath`).
+* Cold start from the green steps, with unit and end-to-end tests.
 
 ## Alternatives
 
@@ -511,15 +434,6 @@ needs `restartPolicy` `OnFailure` or `Always`, a kubelet restart with its
 back-off, and an NRI trigger on the container-creation path that must work when
 the `PodSnapshot` is gone. In-place needs none of these, and the green, yellow,
 and red split answers its one weakness, a container the restore has changed.
-
-**Reuse `restore-failed` as the trigger.** It makes the proxy exit by itself,
-and means "restore spent", not "run the command".
-
-**A Pod annotation as the trigger.** The proxy cannot read the Pod's annotations
-without Kubernetes credentials, which it does not have.
-
-**A cluster-wide switch** is left out so behavior is explicit per Pod, and can be
-added later. **Default on** would change every Pod on upgrade.
 
 ## Appendix
 
@@ -533,22 +447,18 @@ added later. **Default on** would change every Pod on upgrade.
 
 The steps follow the restore in execution order. "Host" steps run in the agent;
 "in the container" steps run in `nsrestore`, inside the container's namespaces
-(`agent/internal/executor/nsrestore.go`). The color is the target; the
-"Phase 1" column says what phase 1 does with the step.
+(`agent/internal/executor/nsrestore.go`). The color is the target; the "Now"
+column says what the current implementation does with the step, where every
+yellow step counts as red.
 
-In phase 2 the agent runs the undos of the yellow rows in **reverse order**
-(LIFO), the last change first, as `defer` does, because later changes build on
-earlier ones, such as a mount on top of a mount. If an undo fails, the agent
-still runs the rest, and the container is tainted.
-
-| # | Color | Step | Phase 1 | What it does, and the undo |
+| # | Color | Step | Now | What it does, and the undo |
 | --- | --- | --- | --- | --- |
 | 1 | Green | Host: resolve the checkpoint, read the manifest, check compatibility | Green | Read-only. A refusal (`RestoreIncompatible`) is here. |
 | 2 | Green | Host: find the container, check that PID 1 is the proxy | Green | Read-only. No proxy means no fallback. |
-| 3 | Yellow | Host: mount the bundle, `cuinterpose`, the checkpoint source into the container | Green | The deferred cleanup that already runs. |
-| 4 | Yellow | Host: PageBroker stage | Green | The PageBroker abort that already runs. |
+| 3 | Yellow | Host: mount the bundle, `cuinterpose`, the checkpoint source into the container | Red | The deferred cleanup that already runs. |
+| 4 | Yellow | Host: PageBroker stage | Red | The PageBroker abort that already runs. |
 | 5 | Green | In the container: read the manifest, check the CUDA job file, check LSM labels, build the CRIU options | Green | Read-only. |
-| 6 | Yellow | In the container: write the inet remap file (`snapshot-inet-remap-*.map`) | Green | Delete the file. Today it is never deleted, and phase 1 leaves it. |
+| 6 | Yellow | In the container: write the inet remap file (`snapshot-inet-remap-*.map`) | Red | Delete the file. Today it is never deleted. |
 | 7 | Yellow | In the container: stage the rootfs diff to a temporary file | Red | Delete the temporary file (a defer already does). |
 | 8 | Red | In the container: apply the rootfs diff (`tar -x` into `/`) | Red | Starts writing files and leaves no record of which. With `--skip-old-files` a half-written file is never fixed. |
 | 9 | Red | In the container: apply the deleted-files list (`RemoveAll`) | Red | Cannot be undone, and errors are only logged. |
@@ -557,9 +467,9 @@ still runs the rest, and the container is tainted.
 | 12 | Red today | In the container: unmount `/dev/shm` | Red | Never remounted. Yellow if the mount options are recorded first and re-mounted on failure. |
 | 13 | Yellow | In the container: remount `/proc/sys` read-write | Red | Remount read-only (a defer does; lost if `nsrestore` is killed). |
 | 14 | Yellow | In the container: mount `securityfs` | Red | `MNT_DETACH` (a defer does). |
-| 15 | Green | In the container: delete the `restore-*` sentinels and the CRIU `kdat` cache | Red | Files the flow owns; a judgment call. Red in phase 1 only because it is after `executeRestore` starts. |
+| 15 | Green | In the container: delete the `restore-*` sentinels and the CRIU `kdat` cache | Red | Files the flow owns; a judgment call. Red now only because it is after `executeRestore` starts. |
 | 16 | Yellow | In the container: CRIU scratch directory, replacement `files.img` | Red | The cleanup that already runs. The scratch directory given by `workDir` is never removed. |
-| 17 | Green | In the container: CRIU, before it calls `PreRestore` | Red | CRIU only checks options and kernel features. Red in phase 1 for the same reason as row 15. |
+| 17 | Green | In the container: CRIU, before it calls `PreRestore` | Red | CRIU only checks options and kernel features. Red now for the same reason as row 15. |
 | 18 | Red | In the container: CRIU, from `PreRestore` on | Red | Processes and mounts are created. Yellow only if "kill the restored tree" is proved. |
 | 19 | Red | In the container: CUDA restore, unlock, `cuinterpose` | Red | Same as CRIU. |
 | 20 | Red | Host: PageBroker CustomStorage, GPU restore failed | Red | The container is already terminated. |
